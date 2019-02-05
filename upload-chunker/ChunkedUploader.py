@@ -70,8 +70,10 @@ class ChunkedUploader:
 
         if 'config_ini_filepath' in options:
             config_ini_filepath = options['config_ini_filepath']
+            custom_config_file = True
         else:
             config_ini_filepath = 'config.ini'
+            custom_config_file = False
 
         path = Path(config_ini_filepath)
         if not path.exists() or not path.is_file():
@@ -87,7 +89,10 @@ class ChunkedUploader:
         self._total_chunked = 0
         self._total_uploaded = 0
 
-        # "fake" async, main thread continues with it execution, after start() method is called!
+        self._start_time = None
+        self._end_time = None
+
+        # "fake" async, main thread continues with its execution, after start() method is called!
         if 'async_upload' in options and options['async_upload']:
             self._async = True
         else:
@@ -96,17 +101,47 @@ class ChunkedUploader:
         self._filenames = Queue()
         self._chunks = Queue()
 
-        for filepath in options['filenames']:  # TODO check if filenames were passed!
+        if custom_config_file:
+            pass
+
+
+        if 'silent_file_not_exists' in options:
+            silent_file_not_exists = options['silent_file_not_exists']
+        else:
+            silent_file_not_exists = SILENT_FILE_NOT_EXISTS
+
+        if 'silent_file_not_readable' in options:
+            silent_file_not_readable = options['silent_file_not_readable']
+        else:
+            silent_file_not_readable = SILENT_FILE_NOT_READABLE
+
+        for filepath in options['filepaths']:
             path = Path(filepath)
             if not path.exists() or not path.is_file():
                 self._execute_callback_operation('filepath_not_exists', self, filepath)
+                if silent_file_not_exists:
+                    continue
+                else:
+                    raise FileNotFoundError('File not found, path: %s' % filepath)
                 # todo raise error -> + silent
             if not os.access(filepath, os.R_OK):
                 self._execute_callback_operation('filepath_not_readable', self, filepath)
                 # todo raise error -> + silent
 
             filesize = os.path.getsize(filepath)
-            self._filenames.put((filepath, filesize))
+
+            # Obtain filename hash for identifier
+            filename = filepath.split(os.sep)[-1]
+            hash_object = hashlib.sha1(filename.encode('utf-8'))
+            filename_hash = hash_object.hexdigest()
+
+            self._filenames.put({
+                'filepath': filepath,
+                'offset_done': 0,
+                'filename_hash': filename_hash,
+                'file_size': filesize,
+                'file_object': open(filepath, "rb")
+            })
 
         if 'logger' in options['logger']:
             if not isinstance(options['logger'], logger):
@@ -133,34 +168,29 @@ class ChunkedUploader:
 
         return self._callbacks[operation](chunked_uploader, *args)
 
-    def chunk_file(self, filepath):
-        if not filepath:
-            raise ValueError('Invalid filepath provided: %s' % filepath)
+    def _get_file_chunk(self, file_obj, filename_hash, filename, offset=0):
+        if not file_obj:
+            raise ValueError('Invalid filepath provided: %s' % file_obj)
 
-        # Obtain filename hash for identifier
-        filename = filepath.split(os.sep)[-1]
-        hash_object = hashlib.sha1(filename.encode('utf-8'))
-        filename_hash = hash_object.hexdigest()
+        with file_obj as f:
+            f.seek(offset)
+            chunk = f.read(SIZE)
+            if len(chunk) == 0:
+                yield None
 
-        with open(filepath, "rb") as f:
-            counter = 0
-            while True:
-                f.seek(counter)
-                chunk = f.read(SIZE)
-                if len(chunk) == 0:
-                    yield None
-
-                yield {
-                    "file_id": filename_hash,
-                    "chunk_id": counter,
-                    "filename": filename,
-                    "data": chunk,
-                    "status": "queued"
-                }
-                counter += SIZE
+            yield {
+                "file_id": filename_hash,
+                "chunk_id": offset,
+                "filename": filename,
+                "data": chunk,
+                "status": "queued",
+                "next_chunk": offset+SIZE
+            }
+            offset += SIZE
 
     def start(self):
         threads = []
+        self._start_time = int(time.time())
         self._execute_callback_operation('before_chunking', self)
         for i in range(PARALLEL_CHUNKS):
             r = threading.Thread(name="chunker" + str(i), target=self._chunker)
@@ -178,6 +208,9 @@ class ChunkedUploader:
 
         return True
 
+    def restart(self):
+        pass # todo
+
     def stop(self):
         self._stop = True
 
@@ -186,11 +219,19 @@ class ChunkedUploader:
 
     def get_progress(self):
         return {
-            'done': (self._total_chunked == self._total_uploaded),
+            'done': self.is_done(),
+            'paused': self.is_paused(),
             'total_chunked': self._total_chunked,
-            'total_uploaded': self._total_uploaded
-            # todo: upload: started, upload finished!
+            'total_uploaded': self._total_uploaded,
+            'start_time':(self._start_time if self._start_time else None),
+            'end_time': (self._end_time if self._end_time else None)
         }
+
+    def is_done(self):
+        return (self._total_chunked == self._total_uploaded)
+
+    def is_paused(self):
+        return self.is_paused
 
     def _reset(self):
         self._chunking = True
@@ -200,10 +241,12 @@ class ChunkedUploader:
     def _chunker(self):
         while not self._filenames.empty():
             filepath = self._filenames.get()
-            chunk_generator = self.chunk_file(filepath[0])
+            chunk_generator = self._get_file_chunk(filepath[0])
             while True:
                 chunk = next(chunk_generator)
-                if not chunk:
+                if chunk:
+                    self._filenames.put() ## tu sam stao!
+                else:
                     break
                 self._chunks.put(chunk)
                 self._total_chunked += 1
@@ -229,14 +272,18 @@ class ChunkedUploader:
 
                 if 'fail_counter' in chunk and chunk['fail_counter'] > MAX_CHUNK_RETRY_TIMES:
                     raise Exception(
-                        'Chunk upload failed more than {0} time(s)'
-                            .format(MAX_CHUNK_RETRY_TIMES))
+                        'Chunk upload failed more than {0} time(s)'.format(MAX_CHUNK_RETRY_TIMES))
                 self._chunks.put(chunk)
+
+        if not self._end_time:
+            self._end_time = int(time.time())
 
         return True
 
     def _chunk_upload(self, chunk):
         expiration_time = int(time.time()) + (CHUNK_EXPIRATION_TIME * 60)
+        chunk['expires'] = expiration_time
+        self._execute_callback_operation('before_chunk_upload', self, chunk)
         request = requests.post(self.url, data={
             'file_id': chunk['file_id'],
             'chunk_id': chunk['chunk_id'],
@@ -245,6 +292,7 @@ class ChunkedUploader:
         })
 
         if not request.status_code == 200:
+            self._execute_callback_operation('chunk_upload_failed', self, chunk)
             return False
 
         # data = r.json()
@@ -252,6 +300,7 @@ class ChunkedUploader:
         # if data==None or not data['success'] == True:
         #    return False
 
+        self._execute_callback_operation('after_chunk_upload', self, chunk)
         return True
 
 
